@@ -1,0 +1,295 @@
+# ============================================================
+#  MBG Sentiment Analysis - Big Data Pipeline [RTX 5060 Ready]
+#  Stack: HDFS + Spark + PostgreSQL + Jupyter
+#
+#  Catatan penting:
+#  - File ini mengaktifkan akses GPU untuk spark-master, worker, dan jupyter.
+#  - Pastikan host sudah install NVIDIA Driver + NVIDIA Container Toolkit.
+#  - Dockerfile.spark disarankan memakai Python 3.10+ dan PyTorch CUDA 12.8.
+# ============================================================
+
+networks:
+  mbg-net:
+    driver: bridge
+
+volumes:
+  hadoop_namenode:
+  hadoop_datanode1:
+  hadoop_datanode2:
+  postgres_data:
+  spark_logs:
+  model_cache:
+
+services:
+
+  # ──────────────────────────────────────────────────────────
+  #  HDFS: NameNode + 2 DataNodes
+  # ──────────────────────────────────────────────────────────
+
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: mbg_namenode
+    hostname: namenode
+    restart: unless-stopped
+    ports:
+      - "9870:9870" # HDFS Web UI
+      - "9000:9000" # HDFS RPC
+    environment:
+      CLUSTER_NAME: mbg-cluster
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      CORE_CONF_hadoop_http_staticuser_user: root
+      HDFS_CONF_dfs_replication: 2
+      HDFS_CONF_dfs_namenode_datanode_registration_ip___hostname___check: "false"
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+    networks:
+      - mbg-net
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9870" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  datanode1:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: mbg_datanode1
+    hostname: datanode1
+    restart: unless-stopped
+    ports:
+      - "9864:9864"
+    environment:
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      HDFS_CONF_dfs_replication: 2
+    volumes:
+      - hadoop_datanode1:/hadoop/dfs/data
+    networks:
+      - mbg-net
+    depends_on:
+      namenode:
+        condition: service_healthy
+
+  datanode2:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: mbg_datanode2
+    hostname: datanode2
+    restart: unless-stopped
+    ports:
+      - "9865:9864"
+    environment:
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      HDFS_CONF_dfs_replication: 2
+    volumes:
+      - hadoop_datanode2:/hadoop/dfs/data
+    networks:
+      - mbg-net
+    depends_on:
+      namenode:
+        condition: service_healthy
+
+  # ──────────────────────────────────────────────────────────
+  #  Spark Master + 2 Workers
+  # ──────────────────────────────────────────────────────────
+
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: mbg-spark:latest
+    container_name: mbg_spark_master
+    hostname: spark-master
+    restart: unless-stopped
+    user: root
+    gpus: all
+    ports:
+      - "8080:8080" # Spark Master Web UI
+      - "7077:7077" # Spark Master RPC
+      - "4040:4040" # Spark App UI saat job berjalan
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      PYSPARK_PYTHON: /opt/conda/bin/python
+      PYSPARK_DRIVER_PYTHON: /opt/conda/bin/python
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      GOOGLE_APPLICATION_CREDENTIALS: /opt/gcp/gcp-key.json
+      GCP_PROJECT_ID: final-project-500709
+      BQ_DATASET: mbg_sentiment
+      BQ_LOCATION: asia-southeast2
+      
+
+    volumes:
+      - ./spark_jobs:/opt/spark_jobs
+      - ./configs:/opt/configs
+      - ./data:/opt/data
+      - ./models:/opt/models
+      - ./scripts:/opt/scripts
+      - spark_logs:/opt/spark/logs
+      - model_cache:/root/.cache/huggingface
+      - ./secrets:/opt/gcp:ro
+    entrypoint: [ "bash", "/opt/entrypoint.sh", "master" ]
+    networks:
+      - mbg-net
+    depends_on:
+      namenode:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  spark-worker-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: mbg-spark:latest
+    container_name: mbg_spark_worker1
+    hostname: spark-worker-1
+    restart: unless-stopped
+    user: root
+    gpus: all
+    ports:
+      - "8081:8081"
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 4G
+      SPARK_WORKER_CORES: 4
+      SPARK_WORKER_WEBUI_PORT: 8081
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      PYSPARK_PYTHON: /opt/conda/bin/python
+      PYSPARK_DRIVER_PYTHON: /opt/conda/bin/python
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ./spark_jobs:/opt/spark_jobs
+      - ./configs:/opt/configs
+      - ./data:/opt/data
+      - ./models:/opt/models
+      - spark_logs:/opt/spark/logs
+      - model_cache:/root/.cache/huggingface
+    entrypoint: [ "bash", "-c", "sleep 5 && bash /opt/entrypoint.sh worker spark://spark-master:7077 8081" ]
+    networks:
+      - mbg-net
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8081" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  spark-worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: mbg-spark:latest
+    container_name: mbg_spark_worker2
+    hostname: spark-worker-2
+    restart: unless-stopped
+    user: root
+    gpus: all
+    ports:
+      - "8082:8082"
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 4G
+      SPARK_WORKER_CORES: 4
+      SPARK_WORKER_WEBUI_PORT: 8082
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      PYSPARK_PYTHON: /opt/conda/bin/python
+      PYSPARK_DRIVER_PYTHON: /opt/conda/bin/python
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ./spark_jobs:/opt/spark_jobs
+      - ./configs:/opt/configs
+      - ./data:/opt/data
+      - ./models:/opt/models
+      - spark_logs:/opt/spark/logs
+      - model_cache:/root/.cache/huggingface
+    entrypoint: [ "bash", "-c", "sleep 10 && bash /opt/entrypoint.sh worker spark://spark-master:7077 8082" ]
+    networks:
+      - mbg-net
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8082" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ──────────────────────────────────────────────────────────
+  #  PostgreSQL - final output sink
+  # ──────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: mbg_postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: mbg_sentiment
+      POSTGRES_USER: mbg_user
+      POSTGRES_PASSWORD: mbg_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - mbg-net
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U mbg_user -d mbg_sentiment" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ──────────────────────────────────────────────────────────
+  #  Jupyter Notebook - eksplorasi, training, monitoring
+  # ──────────────────────────────────────────────────────────
+
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: mbg-spark:latest
+    container_name: mbg_jupyter
+    hostname: jupyter
+    restart: unless-stopped
+    user: root
+    gpus: all
+    ports:
+      - "8888:8888"
+      - "4041:4040" # Spark UI jika job dijalankan dari Jupyter
+    environment:
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      PYSPARK_PYTHON: /opt/conda/bin/python
+      PYSPARK_DRIVER_PYTHON: /opt/conda/bin/python
+      JUPYTER_ENABLE_LAB: "yes"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ./spark_jobs:/opt/spark_jobs
+      - ./configs:/opt/configs
+      - ./data:/opt/data
+      - ./models:/opt/models
+      - ./monitoring:/opt/monitoring
+      - spark_logs:/opt/spark/logs
+      - model_cache:/root/.cache/huggingface
+    entrypoint:
+      - bash
+      - -c
+      - |
+        jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root \
+          --NotebookApp.token=mbgtoken \
+          --notebook-dir=/opt
+    networks:
+      - mbg-net
+    depends_on:
+      spark-master:
+        condition: service_healthy
