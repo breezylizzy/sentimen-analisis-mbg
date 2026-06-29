@@ -183,8 +183,8 @@ def get_bq_client():
             f"File gcp-key.json tidak ditemukan di: {key_path}"
         )
 
-    credentials = service_account.Credentials.from_service_account_file(
-        key_path,
+    credentials = service_account.Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
         scopes=["https://www.googleapis.com/auth/cloud-platform"],
     )
 
