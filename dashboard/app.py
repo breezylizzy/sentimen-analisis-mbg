@@ -175,22 +175,29 @@ def insight(icon, title, body):
 # =========================
 @st.cache_resource(show_spinner=False)
 def get_bq_client():
+    # Coba dari st.secrets dulu (Streamlit Cloud / secrets.toml lokal)
+    if "gcp_service_account" in st.secrets:
+        credentials = service_account.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        return bigquery.Client(credentials=credentials, project=PROJECT_ID)
+
+    # Fallback: file gcp-key.json untuk keperluan lokal tanpa secrets.toml
     app_dir = os.path.dirname(os.path.abspath(__file__))
     key_path = os.path.join(app_dir, "gcp-key.json")
 
-    if not os.path.exists(key_path):
-        raise FileNotFoundError(
-            f"File gcp-key.json tidak ditemukan di: {key_path}"
+    if os.path.exists(key_path):
+        credentials = service_account.Credentials.from_service_account_file(
+            key_path,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
         )
+        return bigquery.Client(credentials=credentials, project=PROJECT_ID)
 
-    credentials = service_account.Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
-        scopes=["https://www.googleapis.com/auth/cloud-platform"],
-    )
-
-    return bigquery.Client(
-        credentials=credentials,
-        project=PROJECT_ID
+    raise FileNotFoundError(
+        "Kredensial GCP tidak ditemukan. "
+        "Di Streamlit Cloud: tambahkan [gcp_service_account] di Settings → Secrets. "
+        "Lokal: buat .streamlit/secrets.toml atau letakkan gcp-key.json satu folder dengan app.py."
     )
 
 
@@ -311,7 +318,7 @@ except Exception as e:
     st.error("❌ Gagal mengambil data dari BigQuery")
     st.warning(str(e))
     st.info(
-        "Cek: `gcp-key.json` sudah satu folder dengan `app.py`, "
+        "Cek: di Streamlit Cloud sudah ada `[gcp_service_account]` di Settings → Secrets, "
         "BigQuery API aktif, billing aktif, dan service account punya akses BigQuery."
     )
     st.stop()
